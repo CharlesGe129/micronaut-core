@@ -83,6 +83,7 @@ import io.micronaut.http.netty.channel.ChannelPipelineCustomizer;
 import io.micronaut.http.netty.channel.ChannelPipelineListener;
 import io.micronaut.http.netty.channel.NettyThreadFactory;
 import io.micronaut.http.netty.stream.DefaultHttp2Content;
+import io.micronaut.http.netty.stream.DefaultStreamedHttpResponse;
 import io.micronaut.http.netty.stream.Http2Content;
 import io.micronaut.http.netty.stream.HttpStreamsClientHandler;
 import io.micronaut.http.netty.stream.JsonSubscriber;
@@ -197,6 +198,8 @@ import java.util.stream.Collectors;
 
 import static io.micronaut.http.client.HttpClientConfiguration.DEFAULT_SHUTDOWN_QUIET_PERIOD_MILLISECONDS;
 import static io.micronaut.http.client.HttpClientConfiguration.DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS;
+import static io.micronaut.http.netty.channel.ChannelPipelineCustomizer.HANDLER_HTTP2_SETTINGS;
+import static io.micronaut.http.netty.channel.ChannelPipelineCustomizer.HANDLER_IDLE_STATE;
 import static io.micronaut.scheduling.instrument.InvocationInstrumenter.NOOP;
 
 /**
@@ -212,7 +215,6 @@ public class DefaultHttpClient implements
         StreamingHttpClient,
         SseClient,
         ProxyHttpClient,
-        ChannelPipelineCustomizer,
         Closeable,
         AutoCloseable {
 
@@ -220,6 +222,27 @@ public class DefaultHttpClient implements
     private static final AttributeKey<Http2Stream> STREAM_KEY = AttributeKey.valueOf("micronaut.http2.stream");
     private static final int DEFAULT_HTTP_PORT = 80;
     private static final int DEFAULT_HTTPS_PORT = 443;
+
+    /**
+     * Which headers <i>not</i> to copy from the first request when redirecting to a second request. There doesn't
+     * appear to be a spec for this. {@link java.net.HttpURLConnection} seems to drop all headers, but that would be a
+     * breaking change.
+     * <p>
+     * Stored as a {@link HttpHeaders} with empty values because presumably someone thought about optimizing those
+     * already.
+     */
+    private static final HttpHeaders REDIRECT_HEADER_BLOCKLIST;
+
+    static {
+        REDIRECT_HEADER_BLOCKLIST = new DefaultHttpHeaders();
+        // The host should be recalculated based on the location
+        REDIRECT_HEADER_BLOCKLIST.add(HttpHeaderNames.HOST, "");
+        // post body headers
+        REDIRECT_HEADER_BLOCKLIST.add(HttpHeaderNames.CONTENT_TYPE, "");
+        REDIRECT_HEADER_BLOCKLIST.add(HttpHeaderNames.CONTENT_LENGTH, "");
+        REDIRECT_HEADER_BLOCKLIST.add(HttpHeaderNames.TRANSFER_ENCODING, "");
+        REDIRECT_HEADER_BLOCKLIST.add(HttpHeaderNames.CONNECTION, "");
+    }
 
     protected final Bootstrap bootstrap;
     protected EventLoopGroup group;
@@ -245,7 +268,7 @@ public class DefaultHttpClient implements
     private final HttpClientFilterResolver<ClientFilterResolutionContext> filterResolver;
     private final WebSocketBeanRegistry webSocketRegistry;
     private final RequestBinderRegistry requestBinderRegistry;
-    private final Collection<ChannelPipelineListener> pipelineListeners = new ArrayList<>(2);
+    private final Collection<ChannelPipelineListener> pipelineListeners;
     private final List<InvocationInstrumenterFactory> invocationInstrumenterFactories;
 
     /**
@@ -270,13 +293,12 @@ public class DefaultHttpClient implements
             @Nullable AnnotationMetadataResolver annotationMetadataResolver,
             List<InvocationInstrumenterFactory> invocationInstrumenterFactories,
             HttpClientFilter... filters) {
-        this(loadBalancer, io.micronaut.http.HttpVersion.HTTP_1_1, configuration, contextPath, new DefaultHttpClientFilterResolver(annotationMetadataResolver, Arrays.asList(filters)), null, threadFactory, nettyClientSslBuilder, codecRegistry, WebSocketBeanRegistry.EMPTY, new DefaultRequestBinderRegistry(ConversionService.SHARED), null, NioSocketChannel::new, invocationInstrumenterFactories);
+        this(loadBalancer, configuration.getHttpVersion(), configuration, contextPath, new DefaultHttpClientFilterResolver(annotationMetadataResolver, Arrays.asList(filters)), null, threadFactory, nettyClientSslBuilder, codecRegistry, WebSocketBeanRegistry.EMPTY, new DefaultRequestBinderRegistry(ConversionService.SHARED), null, NioSocketChannel::new, Collections.emptySet(), invocationInstrumenterFactories);
     }
 
     /**
      * Construct a client for the given arguments.
-     *
-     * @param loadBalancer                    The {@link LoadBalancer} to use for selecting servers
+     *  @param loadBalancer                    The {@link LoadBalancer} to use for selecting servers
      * @param httpVersion                     The HTTP version to use. Can be null and defaults to {@link io.micronaut.http.HttpVersion#HTTP_1_1}
      * @param configuration                   The {@link HttpClientConfiguration} object
      * @param contextPath                     The base URI to prepend to request uris
@@ -289,6 +311,7 @@ public class DefaultHttpClient implements
      * @param requestBinderRegistry           The request binder registry
      * @param eventLoopGroup                  The event loop group to use
      * @param socketChannelFactory            The socket channel factory
+     * @param pipelineListeners               The listeners to call for pipeline customization
      * @param invocationInstrumenterFactories The invocation instrumeter factories to instrument netty handlers execution with
      */
     public DefaultHttpClient(@Nullable LoadBalancer loadBalancer,
@@ -304,8 +327,9 @@ public class DefaultHttpClient implements
                              @NonNull RequestBinderRegistry requestBinderRegistry,
                              @Nullable EventLoopGroup eventLoopGroup,
                              @NonNull ChannelFactory socketChannelFactory,
+                             Collection<ChannelPipelineListener> pipelineListeners,
                              List<InvocationInstrumenterFactory> invocationInstrumenterFactories
-            ) {
+    ) {
         ArgumentUtils.requireNonNull("nettyClientSslBuilder", nettyClientSslBuilder);
         ArgumentUtils.requireNonNull("codecRegistry", codecRegistry);
         ArgumentUtils.requireNonNull("webSocketBeanRegistry", webSocketBeanRegistry);
@@ -419,6 +443,7 @@ public class DefaultHttpClient implements
         }
         this.webSocketRegistry = webSocketBeanRegistry != null ? webSocketBeanRegistry : WebSocketBeanRegistry.EMPTY;
         this.requestBinderRegistry = requestBinderRegistry;
+        this.pipelineListeners = pipelineListeners;
     }
 
     /**
@@ -1343,7 +1368,7 @@ public class DefaultHttpClient implements
             // if the request URI includes a scheme then it is fully qualified so use the direct server
             return Flux.just(requestURI);
         } else {
-            if (parentRequest == null) {
+            if (parentRequest == null || parentRequest.getUri().getHost() == null) {
                 return resolveURI(request, false);
             } else {
                 URI parentURI = parentRequest.getUri();
@@ -2028,7 +2053,6 @@ public class DefaultHttpClient implements
         ChannelPipeline pipeline = channel.pipeline();
         pipeline.addLast(ChannelPipelineCustomizer.HANDLER_MICRONAUT_HTTP_RESPONSE_FULL, new SimpleChannelInboundHandlerInstrumented<FullHttpResponse>() {
             final AtomicBoolean received = new AtomicBoolean(false);
-            final AtomicBoolean emitted = new AtomicBoolean(false);
 
             @Override
             public boolean acceptInboundMessage(Object msg) {
@@ -2053,10 +2077,28 @@ public class DefaultHttpClient implements
             @Override
             protected void channelReadInstrumented(ChannelHandlerContext ctx, FullHttpResponse msg) {
                 if (received.compareAndSet(false, true)) {
-                    NettyMutableHttpResponse<Object> response = new NettyMutableHttpResponse<>(
-                            msg,
-                            ConversionService.SHARED
+                    HttpResponseStatus status = msg.status();
+                    int statusCode = status.code();
+                    HttpStatus httpStatus;
+                    try {
+                        httpStatus = HttpStatus.valueOf(statusCode);
+                    } catch (IllegalArgumentException e) {
+                        emitter.error(e);
+                        return;
+                    }
+                    Publisher<HttpContent> bodyPublisher;
+                    if (msg.content() instanceof EmptyByteBuf) {
+                        bodyPublisher = Publishers.empty();
+                    } else {
+                        bodyPublisher = Publishers.just(new DefaultLastHttpContent(msg.content()));
+                    }
+                    DefaultStreamedHttpResponse nettyResponse = new DefaultStreamedHttpResponse(
+                            msg.protocolVersion(),
+                            msg.status(),
+                            msg.headers(),
+                            bodyPublisher
                     );
+                    NettyStreamedHttpResponse response = new NettyStreamedHttpResponse(nettyResponse, httpStatus);
                     HttpHeaders headers = msg.headers();
                     if (log.isTraceEnabled()) {
                         log.trace("HTTP Client Streaming Response Received ({}) for Request: {} {}", msg.status(), nettyRequest.method().name(), nettyRequest.uri());
@@ -2125,13 +2167,11 @@ public class DefaultHttpClient implements
                                 @Override
                                 public void onNext(io.micronaut.http.HttpResponse<Object> objectHttpResponse) {
                                     emitter.next(objectHttpResponse);
-                                    sub.cancel();
                                 }
 
                                 @Override
                                 public void onError(Throwable t) {
                                     emitter.error(t);
-                                    sub.cancel();
                                 }
 
                                 @Override
@@ -2542,9 +2582,11 @@ public class DefaultHttpClient implements
 
     private void setRedirectHeaders(@Nullable HttpRequest request, MutableHttpRequest<Object> redirectRequest) {
         if (request != null) {
-            request.headers().forEach(header -> redirectRequest.header(header.getKey(), header.getValue()));
-            //The host should be recalculated based on the location
-            redirectRequest.getHeaders().remove(HttpHeaderNames.HOST);
+            request.headers().forEach(header -> {
+                if (!REDIRECT_HEADER_BLOCKLIST.contains(header.getKey())) {
+                    redirectRequest.header(header.getKey(), header.getValue());
+                }
+            });
         }
     }
 
@@ -2553,19 +2595,19 @@ public class DefaultHttpClient implements
             final Iterator<Map.Entry<String, List<String>>> headerIterator = request.getHeaders().iterator();
             while (headerIterator.hasNext()) {
                 final Map.Entry<String, List<String>> originalHeader = headerIterator.next();
-                final List<String> originalHeaderValue = originalHeader.getValue();
-                if (originalHeaderValue != null && !originalHeaderValue.isEmpty()) {
-                    final Iterator<String> headerValueIterator = originalHeaderValue.iterator();
-                    while (headerValueIterator.hasNext()) {
-                        final String value = headerValueIterator.next();
-                        if (value != null) {
-                            redirectRequest.header(originalHeader.getKey(), value);
+                if (!REDIRECT_HEADER_BLOCKLIST.contains(originalHeader.getKey())) {
+                    final List<String> originalHeaderValue = originalHeader.getValue();
+                    if (originalHeaderValue != null && !originalHeaderValue.isEmpty()) {
+                        final Iterator<String> headerValueIterator = originalHeaderValue.iterator();
+                        while (headerValueIterator.hasNext()) {
+                            final String value = headerValueIterator.next();
+                            if (value != null) {
+                                redirectRequest.header(originalHeader.getKey(), value);
+                            }
                         }
                     }
                 }
             }
-            //The host should be recalculated based on the location
-            redirectRequest.getHeaders().remove(HttpHeaderNames.HOST);
         }
     }
 
@@ -2855,16 +2897,6 @@ public class DefaultHttpClient implements
                 }
             }
         };
-    }
-
-    @Override
-    public boolean isClientChannel() {
-        return true;
-    }
-
-    @Override
-    public void doOnConnect(@NonNull ChannelPipelineListener listener) {
-        this.pipelineListeners.add(Objects.requireNonNull(listener, "The listener cannot be null"));
     }
 
     @Override

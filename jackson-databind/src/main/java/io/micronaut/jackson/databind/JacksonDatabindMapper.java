@@ -15,6 +15,7 @@
  */
 package io.micronaut.jackson.databind;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micronaut.context.annotation.BootstrapContextCompatible;
@@ -24,6 +25,7 @@ import io.micronaut.core.annotation.NonNull;
 import io.micronaut.core.annotation.Nullable;
 import io.micronaut.core.type.Argument;
 import io.micronaut.jackson.JacksonConfiguration;
+import io.micronaut.jackson.ObjectMapperFactory;
 import io.micronaut.jackson.codec.JacksonFeatures;
 import io.micronaut.jackson.core.tree.JsonNodeTreeCodec;
 import io.micronaut.jackson.core.tree.TreeGenerator;
@@ -69,7 +71,7 @@ public final class JacksonDatabindMapper implements JsonMapper {
 
     @Internal
     public JacksonDatabindMapper() {
-        this(new ObjectMapper());
+        this(new ObjectMapperFactory().objectMapper(null, null));
     }
 
     @Internal
@@ -79,7 +81,7 @@ public final class JacksonDatabindMapper implements JsonMapper {
 
     @Override
     public <T> T readValueFromTree(@NonNull JsonNode tree, @NonNull Argument<T> type) throws IOException {
-        return objectMapper.readValue(treeCodec.treeAsTokens(tree), JacksonConfiguration.constructType(type, objectMapper.getTypeFactory()));
+        return objectMapper.readValue(treeAsTokens(tree), JacksonConfiguration.constructType(type, objectMapper.getTypeFactory()));
     }
 
     @Override
@@ -112,7 +114,7 @@ public final class JacksonDatabindMapper implements JsonMapper {
 
     @Override
     public void updateValueFromTree(Object value, @NonNull JsonNode tree) throws IOException {
-        objectMapper.readerForUpdating(value).readValue(treeCodec.treeAsTokens(tree));
+        objectMapper.readerForUpdating(value).readValue(treeAsTokens(tree));
     }
 
     @Override
@@ -158,5 +160,11 @@ public final class JacksonDatabindMapper implements JsonMapper {
     public Optional<JsonFeatures> detectFeatures(@NonNull AnnotationMetadata annotations) {
         return Optional.ofNullable(annotations.getAnnotation(io.micronaut.jackson.annotation.JacksonFeatures.class))
                 .map(JacksonFeatures::fromAnnotation);
+    }
+
+    private JsonParser treeAsTokens(@NonNull JsonNode tree) {
+        JsonParser parser = treeCodec.treeAsTokens(tree);
+        parser.setCodec(objectMapper);
+        return parser;
     }
 }
